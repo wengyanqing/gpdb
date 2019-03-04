@@ -27,6 +27,7 @@
 #include "cdb/cdbsrlz.h"
 #include "cdb/tupleremap.h"
 #include "nodes/execnodes.h"
+#include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
 #include "utils/datum.h"
 #include "utils/guc.h"
@@ -44,6 +45,7 @@
 #include "cdb/cdbdisp_dtx.h"	/* for qdSerializeDtxContextInfo() */
 #include "cdb/cdbdispatchresult.h"
 #include "cdb/cdbcopy.h"
+#include "cdb/cdbendpoint.h"
 #include "executor/execUtils.h"
 
 #define QUERY_STRING_TRUNCATE_SIZE (1024)
@@ -91,6 +93,10 @@ typedef struct DispatchCommandQueryParms
 	 */
 	char	   *serializedDtxContextInfo;
 	int			serializedDtxContextInfolen;
+
+	/* the token for parallel cursor */
+	int			token;
+	int			sessionId;
 } DispatchCommandQueryParms;
 
 static int fillSliceVector(SliceTable *sliceTable,
@@ -462,6 +468,8 @@ cdbdisp_buildCommandQueryParms(const char *strCommand, int flags)
 	pQueryParms->serializedQuerytreelen = 0;
 	pQueryParms->serializedQueryDispatchDesc = NULL;
 	pQueryParms->serializedQueryDispatchDesclen = 0;
+	pQueryParms->token = InvalidToken;
+	pQueryParms->sessionId = INVALID_SESSION_ID;
 
 	/*
 	 * Serialize a version of our DTX Context Info
@@ -533,7 +541,8 @@ cdbdisp_buildUtilityQueryParms(struct Node *stmt,
 	pQueryParms->serializedQuerytreelen = serializedQuerytree_len;
 	pQueryParms->serializedQueryDispatchDesc = serializedQueryDispatchDesc;
 	pQueryParms->serializedQueryDispatchDesclen = serializedQueryDispatchDesc_len;
-
+	pQueryParms->token = InvalidToken;
+	pQueryParms->sessionId = INVALID_SESSION_ID;
 	/*
 	 * Serialize a version of our DTX Context Info
 	 */
@@ -837,6 +846,9 @@ buildGpQueryString(DispatchCommandQueryParms *pQueryParms,
 	int32		numsegments = getgpsegmentCount();
 	StringInfoData resgroupInfo;
 
+	int			token = pQueryParms->token;
+	int			session_id = pQueryParms->sessionId;
+
 	int			tmp,
 				len;
 	uint32		n32;
@@ -888,7 +900,9 @@ buildGpQueryString(DispatchCommandQueryParms *pQueryParms,
 		sddesc_len +
 		sizeof(numsegments) +
 		sizeof(resgroupInfo.len) +
-		resgroupInfo.len;
+		resgroupInfo.len +
+		sizeof(int) +
+		sizeof(int);
 
 	shared_query = palloc0(total_query_len);
 
@@ -1003,6 +1017,15 @@ buildGpQueryString(DispatchCommandQueryParms *pQueryParms,
 		pos += resgroupInfo.len;
 	}
 
+	SetGpToken(token, gp_session_id, currentUserId);
+	tmp = htonl(token);
+	memcpy(pos, &tmp, sizeof(tmp));
+	pos += sizeof(tmp);
+
+	tmp = htonl(session_id);
+	memcpy(pos, &tmp, sizeof(tmp));
+	pos += sizeof(tmp);
+
 	len = pos - shared_query - 1;
 
 	/*
@@ -1042,6 +1065,7 @@ cdbdisp_dispatchX(QueryDesc* queryDesc,
 	CdbDispatcherState *ds;
 	ErrorData *qeError = NULL;
 	DispatchCommandQueryParms *pQueryParms;
+	Portal portal = ActivePortal;
 
 	if (log_dispatch_stats)
 		ResetUsage();
@@ -1070,6 +1094,13 @@ cdbdisp_dispatchX(QueryDesc* queryDesc,
 	AssignGangs(ds, queryDesc);
 
 	/*
+	 * For PARALLEL CURSOR, we should set unique token to QE shared memory,
+	 * so that libpq RETRIEVE mode connection can be established afterwards.
+	 */
+	if (portal->cursorOptions & CURSOR_OPT_PARALLEL) {
+
+	}
+	/*
 	 * Traverse the slice tree in sliceTbl rooted at rootIdx and build a
 	 * vector of slice indexes specifying the order of [potential] dispatch.
 	 */
@@ -1078,6 +1109,8 @@ cdbdisp_dispatchX(QueryDesc* queryDesc,
 	nSlices = fillSliceVector(sliceTbl, rootIdx, sliceVector, nTotalSlices);
 
 	pQueryParms = cdbdisp_buildPlanQueryParms(queryDesc, planRequiresTxn);
+	pQueryParms->token = portal->parallel_cursor_token;
+	pQueryParms->sessionId = gp_session_id;
 	queryText = buildGpQueryString(pQueryParms, &queryTextLength);
 
 	/*
