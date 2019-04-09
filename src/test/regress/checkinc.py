@@ -121,6 +121,10 @@ for f in keys:
         # 2. It might be a system include
         if os.path.exists(os.path.join('/usr/include',i)):
             continue
+        
+        # 2. MACOS
+        if os.path.exists(os.path.join('/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include',i)):
+            continue
 
         # 3. It might not have been well qualified
         (d,s) = os.path.split(f)
