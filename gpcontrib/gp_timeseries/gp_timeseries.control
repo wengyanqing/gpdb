@@ -1,0 +1,5 @@
+# gp_timeseries extension
+comment = 'greenplum time series extension'
+default_version = '1.0'
+module_pathname = '$libdir/gp_timeseries'
+relocatable = true
